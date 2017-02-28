@@ -1,0 +1,818 @@
+---
+title: 'Heterogeneity of human colonic stromal cells in health and inflammatory bowel disease revealed by single cell transcriptome analysis'
+subtitle: 'Epithelial cell analysis'
+author: "James Kinchen, University of Oxford"
+date: "24 February 2017"
+params:
+  project: "P150057"
+output: 
+    html_document:
+        toc: true
+        toc_float: true
+        highlight: tango
+        number_sections: true
+        code_folding: show
+        dev: pdf
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, 
+                      cache = TRUE,
+                      tidy = TRUE,
+                      fig.path = paste0("figures/", params$project,"/")
+                      )
+
+```
+
+# Initial setup
+
+The full gene count table (GSE95435\_P150057\_full\_gene\_count\_table.txt) is required and can be downloaded from GEO. This should be saved in the 'data' subdirectory of the cloned repository.
+
+## Load required libraries
+
+See README.md for package sources
+
+```{r load_libraries}
+
+suppressPackageStartupMessages(library(scater))
+suppressPackageStartupMessages(library(limma))
+suppressPackageStartupMessages(library(scran))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(ggbeeswarm))
+suppressPackageStartupMessages(library(plyr))
+suppressPackageStartupMessages(library(RUVSeq))
+suppressPackageStartupMessages(library(WGCNA))
+suppressPackageStartupMessages(library(lazyeval))
+suppressPackageStartupMessages(library(NMF))
+suppressPackageStartupMessages(library(dendextend))
+suppressPackageStartupMessages(library(gplots))
+suppressPackageStartupMessages(library(viridis))
+suppressPackageStartupMessages(library(reshape2))
+suppressPackageStartupMessages(library(Rtsne))
+suppressPackageStartupMessages(library(matrixStats))
+suppressPackageStartupMessages(library(clusterProfiler))
+suppressPackageStartupMessages(library(org.Hs.eg.db))
+suppressPackageStartupMessages(library(xlsx))
+
+```
+
+## Source accessory functions
+
+```{r helper_functions}
+
+source("R/helper_functions.R")
+
+```
+
+# Assemble dataset
+
+## Load count table and metadata
+
+```{r load_config}
+options(stringsAsFactors = FALSE)
+
+# Load data
+phenoData <- read.table("data/P150057_sample_metadata.txt", sep="\t", quote= "", header = TRUE, check.names = TRUE)
+assayData <- read.table("data/GSE95435_P150057_full_gene_count_table.txt", sep="\t", quote= "", header = TRUE, check.names = TRUE)
+featureData <- read.table("data/GRCH38_rel84_biomart.txt", sep="\t", quote= "", header = TRUE, check.names = TRUE)
+
+# Convert strings to factors where necessary
+phenoData$batchvar <- as.factor(phenoData$batchvar)
+
+# Reorder the assayData columns match the phenoData rows
+col_order <- sapply(row.names(phenoData), function(x) which(colnames(assayData) == x))
+assayData <- assayData[,col_order]             
+
+# Assemble SCESet
+phenoData <- new("AnnotatedDataFrame", phenoData)
+featureData <- new("AnnotatedDataFrame",featureData)
+
+scData <- newSCESet(
+  countData = assayData,
+  phenoData = phenoData,
+  featureData = featureData)
+
+# Add logical feature annotation column for protein coding genes
+fData(scData)$prot_coding <- fData(scData)[,"gene_biotype"] %in% c("IG_C_gene", "IG_V_gene", "protein_coding", "TR_C_gene")
+
+validObject(scData)
+
+scData
+
+```
+
+## Filter dataset to remove controls and cells / genes that failed QC
+
+```{r filter_dataset}
+
+# Remove features not detected with at least 1 count in 1 library from each of the three donors
+scData <- scData[,!grepl("outlier", pData(scData)$library_type)]
+scData <- QC_filter(scData, exprs_data = "counts", detect_limit = 0, 
+                     min_cells = 3, min_batches = 3, plot_title = "Filter undetected and batch-specific features")
+
+# Remove features not detected with at least 5 counts in at least 2 cells passing the QC process
+scData <- scData[,pData(scData)$QCpass]
+scData <- QC_filter(scData, exprs_data = "counts", detect_limit = 4, 
+                     min_cells = 2, min_batches = 1, plot_title = "Filter features not detected in 2 high-quality cells")
+
+```
+
+# Normalisation and adjustment for batch effects
+
+## Library size normalisation
+
+```{r library_size_norm}
+
+# Annotate ERCC spike in transcripts
+fData(scData)[["is_feature_control_ERCC"]] <- grepl("ERCC-", featureNames(scData))
+scData@featureControlInfo <- AnnotatedDataFrame(data.frame(name = "ERCC", stringsAsFactors = FALSE))
+isSpike(scData) <- "ERCC"
+
+# Calculate size factors for spike-ins
+scData <- computeSpikeFactors(scData, type = "ERCC", general.use = FALSE)
+
+#Plot ERCC size factors
+ggplot(data = data.frame(ERCC_SF = pData(scData)$size_factor_ERCC, 
+                         batch = pData(scData)$batchvar), aes(x = batch, y = ERCC_SF)) +
+  geom_quasirandom(aes(fill = batch), size = 5, pch = 21) +
+  stat_summary(fun.y = median, fun.ymin = median, fun.ymax = median,
+               geom = "crossbar", width = 0.5) +
+  ggtitle(label = "ERCC Size Factors") +
+  theme_bw()
+
+# Calculate size factors for enogenous genes by cell pooling
+scData <- computeSumFactors(scData, sizes = seq(7,35,by = 7), assay = "counts", get.spikes = FALSE)
+
+#Plot endogenous gene size factors (LSF - Lunn Size Factor)
+ggplot(data = data.frame(LSF = pData(scData)$size_factor, batch = pData(scData)$batchvar), 
+       aes(x = batch, y = LSF)) +
+  geom_quasirandom(aes(fill = batch), size = 5, pch = 21) +
+  stat_summary(fun.y = median, fun.ymin = median, fun.ymax = median,
+               geom = "crossbar", width = 0.5) +
+  ggtitle(label = "Lunn Size Factors - endogenous genes") +
+  theme_bw()
+
+# Perform library size normalisation
+scData <- scater::normalize.SCESet(scData, exprs_values = "counts", return_norm_as_exprs = FALSE)
+
+```
+
+## Assessment of library size normalisation
+
+By relative log expression (RLE) method (DESeq / EdgeR), compared to scaling all libraries to uniform size (counts per million).
+
+```{r RLE_norm}
+
+p1 <- norm_plotRLE(scData, 
+             assays = c("exprs", "norm_exprs"), 
+             by_batch = FALSE,
+             use_spikes = TRUE) + ggtitle("Median RLE - ERCC") + scale_x_discrete(labels = c("cpm", "scran"))
+
+p2 <- norm_plotRLE(scData, 
+             assays = c("exprs", "norm_exprs"), 
+             by_batch = FALSE,
+             use_spikes = FALSE) + ggtitle("Median RLE - endogenous genes") + scale_x_discrete(labels = c("cpm", "scran"))
+
+multiplot(p1,p2,cols = 2)
+
+```
+
+
+## Adjustment for batch effect
+
+```{r batch_adjust}
+
+# Decompose variance into technical and biological components based on lowess fit of mean variance plot.
+# Identify set of genes showing only technical variance to use as feature controls.
+
+fData(scData)[["bvg"]] <- norm_var_features(
+  scData,
+  assayName = "norm_exprs",
+  span_endog = 0.1,
+  span_spike = 0.4,
+  family = "gaussian",
+  use_endog = TRUE
+)
+
+# RUVg method normalisation using endogenous low variance genes
+
+scData <-norm_RUVg(
+  scData,
+  ctrl_f = !(fData(scData)[["bvg"]] | fData(scData)[["is_feature_control_ERCC"]]),
+  assay_in = "norm_exprs",
+  assay_out = "ruv_endog_exprs",
+  k = 1,
+  isLog = TRUE
+)
+
+```
+
+## Assessment of RUVg adjustment by RLE method
+
+```{r RLE_batch}
+
+norm_plotRLE(
+  scData, 
+  assays = c(
+   "exprs", 
+   "norm_exprs", 
+   "ruv_endog_exprs"
+   ), 
+  by_batch = TRUE,
+  use_spikes = FALSE
+  ) + ggtitle("Median per-cell RLE by biological replicate (batch)")  + scale_x_discrete(labels = c("cpm", "scran", "scran + RUVg"))
+
+```
+
+
+# Clustering Analysis
+
+## Redefine biologically variable genes following RUVg adjustment
+
+```{r redefine_bvg}
+
+fData(scData)[["bvg_ruv_endog"]] <- norm_var_features(
+  scData,
+  assayName = "ruv_endog_exprs",
+  span_endog = 0.1,
+  span_spike = 0.4,
+  family = "gaussian",
+  use_endog = TRUE,
+  plot_title = "Mean / variance - RUV endogenous"
+)
+
+```
+
+## Weighted Gene Co-expression Network Analysis (WGCNA) initial setup
+
+### Experiment settings
+
+```{r WGCNA_settings_1}
+
+## Define initial dataset ##
+############################
+
+# assayData element for WGCNA analysis. Character - must be present in sceSet
+WGCNA_assay <- "ruv_endog_exprs"
+
+# Samples to include. Formula - evaluates to boolean vector length ncol(sceSet)
+get_input_libs <- ~ rep(TRUE,ncol(scData))
+
+# Features to include. Formula - evaluates to boolean vector length nrow(sceSet)
+get_input_features <- ~ fData(scData)[,"bvg_ruv_endog"] & fData(scData)[,"prot_coding"]
+
+# Trait data to include. List - names must all be pData columns, boolean whether to split factors
+# into logical columns corresponding to each factor level
+traits <- list(batchvar=FALSE,batchvar=TRUE)
+
+## Remove outlier samples ##
+############################
+
+# Sample tree cut height. Numeric.
+cut_height <- 300
+
+# Sample tree cluster to keep. Integer.
+n_cluster <- 1
+
+```
+
+### Analysis code 
+
+```{r WGCNA_setup}
+
+allowWGCNAThreads()
+
+# Which libraries to include (boolean, length ncol(sceSet))
+input_libs <- f_eval(get_input_libs)
+
+# Which features to include (boolean, length nrow(sceSet))
+input_features <- f_eval(get_input_features)
+
+# Initial WGCNA expression matrix (rows = samples, cols = genes) opposite to biobase convention
+datExpr2 <- t(assayData(scData)[[WGCNA_assay]][input_features,input_libs])
+
+# WGCNA automatic detection of features with zero variance or too many missing values
+gsg <- goodSamplesGenes(datExpr2, verbose = 0)
+
+# Subset WGCNA expression values to exclude bad genes and samples
+datExpr1 <- datExpr2[gsg$goodSamples, gsg$goodGenes]
+
+# Hierarchical clustering of samples to detect outliers
+sampleTree <- hclust(dist(datExpr1, method = "euclidean"), method = "average")
+
+# Cut the tree to remove outlying samples
+clust <- cutreeStatic(sampleTree, cutHeight = cut_height, minSize = 10)
+
+# Boolean vector of length(input_libraries). TRUE for non-outliers, FALSE for outliers. 
+libraries <- (clust==n_cluster)
+
+# Boolean vector of length ncol(sceSet) mapping included libraries back to original sceSet
+incSamples <- rep(FALSE, length(input_libs))
+incSamples[input_libs][gsg$goodSamples][libraries] <- TRUE
+
+# Subset WGCNA expression values to exclude outlier libraries
+datExpr0 <- datExpr1[libraries,]
+
+# Data frame holding selected trait information to correlate with modules (rows = samples, cols = traits)
+datTraits <- .datTraits()
+
+```
+
+### Results
+
+All genes and samples pass WGCNA QC: `gsg$allOK`
+
+#### Sample Tree
+
+```{r plot_sample_tree}
+
+par( mfrow = c( 1, 1 ) )
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex = 0.5, mar = c(0,4,2,0))
+abline(h = cut_height, col = "red")
+
+```
+
+## WGCNA network construction
+
+### Experiment settings
+
+```{r WGCNA_settings_2}
+
+## Gene co-expression network construction ##
+#############################################
+
+# Threshold for confident detection. Numeric.
+# Need to use log(counts + exprs offset) for counts threshold.  
+exprs_threshold <- log(8 + 1)
+
+# Correlation function. Formula with x as the data
+cor_function <- ~ corFast(x, use = "pairwise.complete.obs")
+
+# Pairwise gene correlations based on fewer than this number
+# of co-expressing cells are discarded. Integer.
+mask_threshold <- 4
+
+# Soft thresholding power. Numeric.
+soft_power <- 4
+
+```
+
+### Analysis code
+
+```{r WCGNA_make_network}
+
+# n genes x p samples
+# Construct n x p boolean expression matrix using a threshold for reliable detection.
+# Calculate n x n cross-product to find number of cells in which both genes were reliably detected for each possible gene pair 
+crossproduct <- crossprod(datExpr0 >= exprs_threshold)
+
+# Calculate n x n adjacency matrix using user defined correlation function
+adjacency <- f_eval(cor_function, data = list(x = datExpr0))
+adjacency[adjacency < 0] <- 0
+
+# Construct an n x n boolean matrix to determine which pairwise gene correlations are based on fewer
+# than the 'mask_threshold' number of expressing cells.
+mask_mat <- (crossproduct < mask_threshold)
+
+# Apply mask to the adjacency matrix.
+adj_mask0 <- adjacency
+adj_mask0[mask_mat] <- 0
+
+# Determine if there are any genes with zero adjacency to any other gene after this step
+no_adj <- (colSums(adj_mask0) == 0)
+
+# Subset the masked adjacency matrix to remove features with zero adjacency
+adj_mask <- adj_mask0[!no_adj,!no_adj]
+
+# Subset WGCNA expression values to remove features with zero adjacency 
+datExpr <- datExpr0[,!no_adj]
+
+# Boolean vector of length nrow(sceSet) mapping included features back to original sceSet
+incFeatures <- rep(FALSE, length(input_features))
+incFeatures[input_features][gsg$goodGenes][!no_adj] <- TRUE
+
+# Calculate dissimilarity from masked adjacency applying a soft-thresholding power
+diss <- 1 - (adj_mask ^ soft_power)
+
+```
+
+## WGCNA module detection
+
+### Experiment settings
+
+```{r WGCNA_settings_3}
+
+## Gene clustering and module detection ##
+##########################################
+
+# Hierarhical clustering method. Character - must be a valid method for 'hclust'.
+agglom_meth <- "average"
+
+# cuttreeDynamic settings. List - must be valid arguments to 'cuttreeDynamic'
+genetree_cut <- list(deepSplit = 3, pamStage = FALSE, pamRespectsDendro = FALSE, minClusterSize = 50)
+
+# Module eigengene merge height
+merge_height <- 0.25
+
+# Optionally reorder default colour sequence to align with another dataset. Character vector or NULL
+# Must be a sequence of colour names from standardColors(). Length >= number of detected modules
+ns_colourseq <- NULL
+
+```
+
+### Analysis code
+
+```{r WGCNA_detect_modules}
+
+# Convert dissimilarity to distance and hierarchically cluster genes 
+geneTree <- hclust(as.dist(diss), method = agglom_meth)
+
+# Detect modules using dynamic tree cut
+dynamicMods <- f_eval( ~ cutreeDynamic(dendro = geneTree, method = "hybrid", distM = diss, verbose = 0, uqs(genetree_cut)))
+names(dynamicMods) <- colnames(datExpr)
+
+# Assign colours to modules
+dynamicColors <- labels2colors(dynamicMods, colorSeq = ns_colourseq)
+
+# Merge similar modules by first hierarchically clustering modules, then cutting the tree at specified height
+merge <- mergeCloseModules(datExpr, dynamicColors, cutHeight = merge_height, verbose = 0)
+
+# Recalculate module colours post merge
+moduleColors <- merge$colors
+
+# Calculate module eigengenes (n_samples x n_modules matrix)
+MEs0 <- moduleEigengenes(datExpr, moduleColors)$eigengenes
+row.names(MEs0) <- row.names(datExpr)
+
+# Reorder eigengene matrix columns
+MEs <- orderMEs(MEs0)
+
+# Vector of module colour identifiers
+modNames  <- substring(names(MEs), 3)
+
+# 'Fuzzy' module membership. Calculate pearson correlation of every gene with module eigengenes.
+geneModuleMembership <- as.data.frame(cor(t(assayData(scData)[[WGCNA_assay]][,incSamples]), MEs, use = "p"))
+names(geneModuleMembership) <- paste("MM", modNames, sep="")
+geneModuleMembership <- subset(geneModuleMembership, select = -MMgrey)
+
+# Calculate p-value for above (not adjusted)
+MMPvalue <- as.data.frame(corPvalueStudent(as.matrix(geneModuleMembership), ncol(geneModuleMembership)))
+names(MMPvalue) <- paste("p.", colnames(geneModuleMembership), sep="")
+
+```
+
+### Results
+
+#### Detected modules
+
+```{r WGCNA_mods_detected}
+
+plotDendroAndColors(geneTree, cbind(dynamicColors, moduleColors),
+                    c("Dynamic Tree Cut", "Merged dynamic"),
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+
+```
+
+#### Module eigengene dissimilarity
+
+```{r WGCNA_ME_dissimilarity}
+
+plotMEmerge()
+
+```
+
+## Cell clustering by non-negative matrix factorisation using module-assigned genes
+
+### Experiment settings
+
+```{r NMF_settings}
+
+## Cell clustering ##
+#####################
+
+# Select modules of interest for cell clustering. List - must be valid arguments to 'subset'
+subset_iMEs <- list(select=c("MEturquoise","MEblue","MEyellow","MEbrown","MEgreen"))
+
+# Options for non-negative matrix factorisation. List - ignored unless method_clust = 'NMF',
+# must be valid arguments to 'nmf' and include 'rank'
+NMF_options <- list(rank = 5, method = "nsNMF", nrun = 50)
+
+# Optional rotation of cell dendrogram for cosmetic reasons. Numeric vector.
+# Refer to 'plotCellDendro' for cluster numbers
+clust_order <- NULL
+
+# Assign module colours to cell clusters. For each module, the cell cluster 
+# showing highest median expression is allocated that module colour. Secondary 
+# cell clusters will be assigned the same module colour only if median expression 
+# exceeds this proportion of the primary cell cluster. Otherwise left unassigned (grey). Numeric.
+pmin_assign_clust_mod <- 0.3 
+
+# Rename cell clusters. Boolean - give descriptive names to modules / clusters. Otherwise colours will be used.
+use_ct_names <- TRUE
+
+# Assign user-defined names to cell clusters using marker gene expression.
+# Named list - marker symbol / cluster name
+ct_markers <- list(EIF3I = "G1",
+                   CHEK1 = "G1/S",
+                   CDC25B = "G2/M",
+                   MUC2 = "SEC", 
+                   SLC26A3 = "ENT")
+
+```
+
+
+### Analysis code
+
+```{r NMF_clustering}
+
+# Subset eigengene matrix to include select modules on which to base cell clustering
+iMEs <- f_eval( ~ subset(MEs, uqs(subset_iMEs)))
+
+# Hierarchically cluster selected module eigengenes
+cl_hr <- hclust(as.dist(1-cor(iMEs, method="pearson")), method="ward.D2")
+
+# Construct pairwise cell distance matrix NMF
+cl_nmf <- f_eval( ~ nmf(t(datExpr[,moduleColors %in% substring(colnames(iMEs),3)]),
+                        seed = 123, uqs(NMF_options)))
+cl_dist <- as.dist(1-cl_nmf@consensus)
+
+# Hierarchically cluster cells based on distance matrix generated above
+cl_hc <- hclust(cl_dist, method = "ward.D2")
+cl_hc$labels <- row.names(MEs)
+
+# Cut the hierarchical clustering tree to generate cell clusters
+dynamicCells <- stats::cutree(cl_hc, k = NMF_options$rank)
+names(dynamicCells) <- row.names(MEs)
+  
+# Assign colour identifiers to detected cell clusters based on highest expressed gene module
+## Calculate median module expression for each cell cluster
+clust_mod <- sapply(1:max(dynamicCells), function(x) rowMedians(t(iMEs[dynamicCells==x,])))
+## Construct logical matrix to determine whether median expression exceeds minimum threshold for assigning a colour
+clust_mod_b <- apply((clust_mod / rowMax(clust_mod)) < pmin_assign_clust_mod,2,all)
+## Assign colour identifiers to clusters based on highest expressed module
+cluster_mods <-  substring(colnames(iMEs),3)[apply(t(clust_mod),1,function(x) which(x %in% max(x)))]
+## If no module is expressed above threshold set cluster colour to 'grey'
+cluster_mods[clust_mod_b] <- "grey"
+  
+# Generate a vector of cluster colours for each cell
+cell_cols <- dynamicCells
+for(i in 1:max(cell_cols)) cell_cols[cell_cols == i] <- cluster_mods[i]
+cell_cols[cell_cols == 0] <- NA
+
+# Optional cosmetic rotation of the cell dendrogram
+rcl_hc <- .orderCells()
+
+# Allocate user-specifed cluster names to replace machine generated colour codes in output
+subset_names <- .assign_celltype()
+
+```
+
+### Results
+
+#### Cell cluster dendrogram
+
+```{r cell_dendro}
+
+plotCellDendro()
+
+```
+
+#### Consensus clustering heatmap
+
+```{r cell_heatmap}
+
+plotCellClusters()
+
+```
+
+#### Module eigengene expression by cell cluster
+
+```{r ME_barchart}
+
+plotMEbars()
+
+```
+
+## Reduced dimension plots
+
+### Experiment settings
+
+```{r PCA_tSNE_settings}
+
+## Reduced dimension plot options ##
+####################################
+
+# PCA options. List - must be valid arguments to 'prcomp'
+pca_opts <- list(center = TRUE, scale. = TRUE)
+
+# TSNE seed. Integer.
+# For reproducibility.
+tsne_seed <- 428
+
+# PCA dimensions to use in TSNE plot. Integer.
+tsne_dims <- 4
+
+# TSNE options. List - must be valid arguments to 'rtsne'
+# max perplexity is floor(nsamples/3)
+tsne_opts <- list(perplexity = 15, max_iter = 2000)
+
+```
+
+### Analysis code
+
+```{r PCA_tSNE}
+
+# Calculate principle components for WGCNA expression matrix (all genes)
+pcs <- f_eval( ~ prcomp(datExpr, uqs(pca_opts)))
+
+# Generate t-SNE embedding with supplied options using PCA above for initial dimension reduction
+set.seed(tsne_seed)
+cell_tSNE <- f_eval ( ~ Rtsne(x, dims = 2, pca = FALSE, theta = 0.01, check_duplicates = FALSE, uqs(tsne_opts)), data = list(x = pcs$x[,1:tsne_dims]))
+
+```
+
+### Results
+
+#### PCA plot
+
+```{r PCA_plot}
+
+plotPCAclusters(ndims = 2, size_by = "detected_genes") + scale_size_continuous(limits=c(0,NA))
+
+```
+
+#### t-SNE plot
+
+```{r tSNE_plot}
+
+plotTSNE()
+
+```
+
+## Marker gene detection
+
+### Experiment settings
+
+```{r marker_settings}
+
+## Marker gene detection settings ##
+####################################
+
+# assayData element for ROC marker gene ranking. Character - must be present in sceSet
+ROC_assay <- "ruv_endog_exprs"
+
+# ROC features for assessment. Formula - evaluates to boolean vector length nrow(sceSet)
+ROCfeatures <- ~ !(fData(scData)[["is_feature_control_ERCC"]])
+
+# Additional metadata to include in the ROCR marker table. Character vector - must all be fData columns
+ROCatts <- c("feature_symbol","bvg_ruv_endog","prot_coding")
+
+# Some genes for violin plots (examples)
+vio_genes <- c("MKI67","MUC2","SLC26A3")
+
+```
+
+### Analysis code
+
+```{r rank_markers}
+
+# Find cluster-specific marker genes using ROCR
+exprs_mat <- assayData(scData)[[ROC_assay]][f_eval(ROCfeatures),incSamples]
+markrs <- .getMarkers(exprs_mat,cell_cols)
+markr_anno <- t(sapply(row.names(markrs), function(x) {
+  fData(scData)[x, ROCatts]
+}))
+ROCmark <- cbind(markr_anno, markrs)
+
+```
+
+### Results
+
+#### Example violin plots
+
+```{r violin_plots}
+
+plotGeneViolins(vio_genes)
+
+```
+
+
+#### Save marker gene lists
+
+```{r save_markers}
+
+saveGeneLists()
+
+```
+
+# Ontology enrichment
+
+## Gene modules
+
+### Analysis code
+
+```{r mod_ontology}
+
+# Generate a named list of module member genes for ontology enrichment steps
+ensembl_modules <- sapply(not_grey(modNames), function(x) names(dynamicMods)[moduleColors==x])
+
+# Generate lists of features to use as the 'background' in the ontology enrichment steps
+ensembl_universe <- fData(scData)$ensembl_gene_id[!is.na(fData(scData)$ensembl_gene_id)]
+
+# Compare module ontology
+mods_go <- compareCluster(
+  ensembl_modules,
+  fun = "enrichGO",
+  universe = ensembl_universe,
+  OrgDb = org.Hs.eg.db, 
+  keytype = "ENSEMBL", 
+  ont = "BP", 
+  minGSSize = 50,
+  pAdjustMethod = "BH", 
+  pvalueCutoff = 0.01, 
+  qvalueCutoff = 0.05,
+  readable = TRUE
+)
+
+```
+
+### Results
+
+#### Module ontology dot plot
+
+```{r mod_dotplot, fig.height=10}
+
+dotplot(mods_go, showCategory = 5, font.size = 10, title = "Module Ontology Enrichment") + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_y_discrete(labels = tidylabel)
+
+```
+
+#### Save full enrichment result
+
+```{r save_mod_go}
+
+saveEnrichLists(mods_go, "modules")
+
+```
+
+## Cell cluster marker genes
+
+### Analysis code
+
+```{r clust_ontology}
+
+# Generate list of top 200 marker genes for each cell cluster
+markrs <- ROCmark[sapply(1:nrow(ROCmark), function(x) all(unlist(ROCmark[x,"bvg_ruv_endog"]))),]
+ensembl_clusters <- sapply(not_grey(modNames), function (x) {
+    mk_out <- markrs[markrs$Group==x,]
+    out_df <- data.frame(ID = row.names(mk_out), AUC = mk_out$AUC)
+    out_df <- out_df[order(out_df$AUC, decreasing = TRUE),]
+    list(out_df$ID[1:min(nrow(out_df),200)])
+  })
+names(ensembl_clusters) <- subset_names[names(ensembl_clusters)]
+
+## Cluster ontology enrichment analysis
+cls_go <- compareCluster(
+  ensembl_clusters,
+  fun = "enrichGO",
+  universe = ensembl_universe,
+  OrgDb = org.Hs.eg.db, 
+  keytype = "ENSEMBL", 
+  ont = "BP", 
+  minGSSize = 20,
+  pAdjustMethod = "BH", 
+  pvalueCutoff = 0.05, 
+  qvalueCutoff = 0.05,
+  readable = TRUE
+)
+
+```
+
+### Results
+
+```{r clust_dot_plot, fig.height=10}
+
+dotplot(cls_go, showCategory = 8, font.size = 10, title = "Cluster Ontology Enrichment") + 
+  theme(plot.title = element_text(hjust = 0.5))  +
+  scale_y_discrete(labels = tidylabel)
+
+```
+
+#### Save full enrichment result
+
+```{r save_clust_ont}
+
+saveEnrichLists(cls_go, "clusters")
+
+```
+
+# Session info
+
+```{r session_info}
+
+sessionInfo()
+
+```
+
